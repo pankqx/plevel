@@ -15,6 +15,7 @@ REPLY = (
 
 class Handler(BaseHTTPRequestHandler):
     delay = 0.01
+    last_chat: dict = {}   # body of the most recent /api/chat request
 
     def log_message(self, *args):  # silence
         pass
@@ -33,6 +34,11 @@ class Handler(BaseHTTPRequestHandler):
                 {"name": "qwen2.5-coder:1.5b", "model": "qwen2.5-coder:1.5b", "size": 986000000},
                 {"name": "qwen2.5-coder:7b", "model": "qwen2.5-coder:7b", "size": 4700000000},
             ]})
+        elif self.path == "/api/ps":
+            self._json({"models": [
+                {"name": "qwen2.5-coder:7b", "model": "qwen2.5-coder:7b",
+                 "size": 4700000000, "size_vram": 2820000000},
+            ]})
         else:
             self.send_response(200)
             self.end_headers()
@@ -44,6 +50,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/api/chat":
             self._json({"error": "not found"}, 404)
             return
+        Handler.last_chat = body
         if not body.get("stream", True):
             self._json({"model": body["model"], "done": True,
                         "message": {"role": "assistant", "content": "Test title"}})
