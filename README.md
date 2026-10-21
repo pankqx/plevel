@@ -71,6 +71,20 @@ What to expect:
 
 The bottom bar and the **System (live)** panel show RAM, CPU load and temperature, GPU load and temperature, VRAM, and where Ollama placed the loaded model. If it says *"60% GPU / 40% CPU (slower)"*, the model did not fit in VRAM; use a smaller model or a smaller context length. Temperatures turn amber and then red when they get high. GPU numbers come from `nvidia-smi` (installed with the NVIDIA driver); CPU temperature needs the `coretemp` sensor, which Ubuntu provides on Intel laptops. Turn it off under **Options** if you don't want it (polling `nvidia-smi` can keep a hybrid-graphics GPU awake, which costs a little battery).
 
+### Test drive (Help → Model test drive, Ctrl+T)
+
+Eight short graded tasks: arithmetic, writing a function, fixing a bug, explaining code,
+following a format, a made-up-API honesty trap, writing a document and finding code in your
+project. Code answers are really executed. When it finishes, **Export report** saves a
+Markdown file with the score, speed, strengths, weaknesses and every answer. Send that file to
+Claude for a full reading. Open the plevel folder as a project first to include the project question.
+
+### Answer formatting
+
+Replies wrap to the window (no sideways scrolling), keep paragraphs and lists, and code gets a
+card with Copy and Save. A reply fenced as ```markdown (for example a `design.md`) is shown as a
+readable document card with Copy/Save instead of raw code.
+
 ### Picking a model and settings
 
 - `qwen2.5-coder:1.5b` is fast and fits a 4 GB GPU entirely. Use it for quick questions and small snippets.
@@ -110,3 +124,7 @@ plevel/
   theme.py         dark stylesheet
 tests/             fake Ollama server, smoke test, context and monitor tests
 ```
+
+## Fonts
+
+Bundled in `plevel/assets/fonts`: Inter and JetBrains Mono, both under the SIL Open Font License 1.1.

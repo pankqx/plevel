@@ -952,6 +952,7 @@ class MainWindow(QMainWindow):
             self.streaming_text = None
             self._set_generating(False)
             self._render()
+            self.reply_done.emit("", 0.0, self.pending_model)
         self.status_label.setText("Error: " + err.splitlines()[0][:120])
 
     # ------------------------------------------------------------ project

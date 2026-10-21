@@ -202,4 +202,11 @@ QFrame#suggest QLabel {{ background: transparent; }}
 QTextBrowser {{ background: transparent; border: none; selection-background-color: {ACCENT};
               selection-color: #ffffff; }}
 QTextEdit {{ background: transparent; border: none; selection-background-color: {ACCENT}; }}
+QTableWidget {{ background-color: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
+              border-radius: 12px; outline: none; }}
+QTableWidget::item {{ padding: 6px 8px; border: none; }}
+QHeaderView {{ background: transparent; }}
+QHeaderView::section {{ background-color: {SURFACE}; color: {MUTED}; border: none;
+              border-bottom: 1px solid {BORDER}; padding: 8px; font-weight: bold; }}
+QTableCornerButton::section {{ background: {SURFACE}; border: none; }}
 """
