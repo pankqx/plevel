@@ -6,17 +6,19 @@ import os
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QSlider, QSplitter, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSplitter,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from . import APP_NAME, __version__
+from .context import Project, build_messages
 from .db import Database
+from .monitor import SystemMonitor
 from .ollama_client import (
     DEFAULT_HOST, ChatWorker, ModelListWorker, TitleWorker,
 )
@@ -59,6 +61,53 @@ LANG_BY_EXT = {
 }
 
 
+GREEN, AMBER, RED = "#5fd38d", "#f0b429", "#ef6b6b"
+
+
+def level_color(pct: float | None, warn: float = 75, hot: float = 90) -> str:
+    if pct is None:
+        return GREEN
+    return RED if pct >= hot else AMBER if pct >= warn else GREEN
+
+
+class PrepareWorker(QThread):
+    """Rescans the project and builds the final message list off the UI thread."""
+
+    ready = Signal(list, dict)
+    failed = Signal(str)
+
+    def __init__(self, project, system: str, history: list, num_ctx: int):
+        super().__init__()
+        self.project = project
+        self.system = system
+        self.history = history
+        self.num_ctx = num_ctx
+
+    def run(self):
+        try:
+            if self.project:
+                self.project.refresh()
+            msgs, info = build_messages(self.system, self.history, self.project, self.num_ctx)
+            self.ready.emit(msgs, info)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class IndexWorker(QThread):
+    done = Signal(int)
+    failed = Signal(str)
+
+    def __init__(self, project):
+        super().__init__()
+        self.project = project
+
+    def run(self):
+        try:
+            self.done.emit(self.project.refresh())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class InputBox(QPlainTextEdit):
     """Enter sends, Shift+Enter inserts a newline."""
 
@@ -97,6 +146,14 @@ class MainWindow(QMainWindow):
         self.t_start = 0.0
         self.ollama_error: str | None = None
         self.installed_models: list[str] = []
+        self.project: Project | None = None
+        self.index_worker: IndexWorker | None = None
+        self.prepare_worker: PrepareWorker | None = None
+        self.monitor: SystemMonitor | None = None
+        self.pending_model = ""
+        self.last_info: dict | None = None
+        self._cancel_prepare = False
+        self._bar_colors: dict[str, str] = {}
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -108,6 +165,9 @@ class MainWindow(QMainWindow):
         self._restore_settings()
         self.reload_chat_list()
         self.refresh_models()
+        last = self.qs.value("last_project", "")
+        if last and Path(last).is_dir():
+            self.set_project(last, persist=False)
         self._render()
 
     # ------------------------------------------------------------------ UI
@@ -124,6 +184,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
         self.status_label = QLabel("")
         self.statusBar().addWidget(self.status_label, 1)
+        self.sys_label = QLabel("")
+        self.statusBar().addPermanentWidget(self.sys_label)
 
     def _build_sidebar(self) -> QWidget:
         side = QFrame()
@@ -152,6 +214,8 @@ class MainWindow(QMainWindow):
 
         self.chat_list = QListWidget()
         self.chat_list.itemClicked.connect(self._on_chat_clicked)
+        self.chat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_list.setTextElideMode(Qt.ElideRight)
         self.chat_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.chat_list.customContextMenuRequested.connect(self._chat_context_menu)
         lay.addWidget(self.chat_list, 1)
@@ -175,6 +239,15 @@ class MainWindow(QMainWindow):
         refresh.setToolTip("Re-read the installed models from Ollama")
         refresh.clicked.connect(self.refresh_models)
         top_l.addWidget(refresh)
+        self.project_btn = QPushButton("Project: none")
+        self.project_btn.setToolTip("Give the model your code: it reads the folder and picks "
+                                    "the files relevant to each question")
+        pmenu = QMenu(self)
+        pmenu.addAction("Open project folder…", self.open_project_dialog)
+        pmenu.addAction("Re-scan project", self.rescan_project)
+        pmenu.addAction("Close project", self.close_project)
+        self.project_btn.setMenu(pmenu)
+        top_l.addWidget(self.project_btn)
         top_l.addStretch(1)
         self.regen_btn = QPushButton("Regenerate")
         self.regen_btn.clicked.connect(self.regenerate)
@@ -200,6 +273,11 @@ class MainWindow(QMainWindow):
         self.attach_label.setObjectName("muted")
         self.attach_label.setVisible(False)
         b_l.addWidget(self.attach_label)
+        self.context_label = QLabel("")
+        self.context_label.setObjectName("muted")
+        self.context_label.setWordWrap(True)
+        self.context_label.setVisible(False)
+        b_l.addWidget(self.context_label)
 
         row = QHBoxLayout()
         self.input = InputBox(self.send_or_stop)
@@ -238,7 +316,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.preset_combo)
         self.system_edit = QPlainTextEdit()
         self.system_edit.setPlaceholderText("Instructions the model follows in this chat")
-        self.system_edit.setMinimumHeight(140)
+        self.system_edit.setMinimumHeight(110)
         self.system_edit.textChanged.connect(self._on_system_changed)
         lay.addWidget(self.system_edit)
 
@@ -250,6 +328,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.temp_slider)
         hint = QLabel("0.2 for code and facts, 0.8 for ideas")
         hint.setObjectName("muted")
+        hint.setWordWrap(True)
         lay.addWidget(hint)
 
         self.ctx_label = QLabel()
@@ -263,6 +342,27 @@ class MainWindow(QMainWindow):
         hint2.setWordWrap(True)
         lay.addWidget(hint2)
 
+        lay.addSpacing(10)
+        sh = QLabel("System (live)")
+        sh.setObjectName("heading")
+        lay.addWidget(sh)
+        self.sys_widgets: dict[str, tuple[QLabel, QProgressBar]] = {}
+        for key in ("ram", "cpu", "gpu", "vram"):
+            lbl = QLabel("…")
+            lbl.setTextFormat(Qt.RichText)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(8)
+            lay.addWidget(lbl)
+            lay.addWidget(bar)
+            self.sys_widgets[key] = (lbl, bar)
+        self.sys_model_label = QLabel("")
+        self.sys_model_label.setObjectName("muted")
+        self.sys_model_label.setWordWrap(True)
+        self.sys_model_label.setTextFormat(Qt.RichText)
+        lay.addWidget(self.sys_model_label)
+
         lay.addStretch(1)
         host = QLabel(f"Ollama: {self.host}")
         host.setObjectName("muted")
@@ -274,6 +374,8 @@ class MainWindow(QMainWindow):
         file_menu = mb.addMenu("&File")
         act = QAction("New chat", self, shortcut=QKeySequence.New, triggered=self.new_chat)
         file_menu.addAction(act)
+        file_menu.addAction(QAction("Open project folder…", self, shortcut="Ctrl+Shift+O",
+                                    triggered=self.open_project_dialog))
         file_menu.addAction(QAction("Attach file…", self, shortcut="Ctrl+O", triggered=self.attach_files))
         file_menu.addAction(QAction("Export chat as Markdown…", self, shortcut="Ctrl+E",
                                     triggered=self.export_chat))
@@ -289,7 +391,12 @@ class MainWindow(QMainWindow):
 
         self.auto_title_action = QAction("Auto-title chats with the model", self, checkable=True)
         self.auto_title_action.setToolTip("Uses one extra short model call per new chat")
-        mb.addMenu("&Options").addAction(self.auto_title_action)
+        self.monitor_action = QAction("Live system monitor", self, checkable=True)
+        self.monitor_action.setToolTip("RAM, CPU, GPU and temperatures, refreshed every 2 seconds")
+        self.monitor_action.toggled.connect(self._set_monitor)
+        opts = mb.addMenu("&Options")
+        opts.addAction(self.auto_title_action)
+        opts.addAction(self.monitor_action)
 
         help_menu = mb.addMenu("&Help")
         help_menu.addAction(QAction("About", self, triggered=self._about))
@@ -306,6 +413,7 @@ class MainWindow(QMainWindow):
         self.default_system = self.qs.value("system_prompt", DEFAULT_SYSTEM_PROMPT)
         self.system_edit.setPlainText(self.default_system)
         self.auto_title_action.setChecked(self.qs.value("auto_title", "false") == "true")
+        self.monitor_action.setChecked(self.qs.value("monitor", "true") == "true")
         self.view.setFont(QFont(self.view.font().family(), int(self.qs.value("font_size", 11))))
 
     def closeEvent(self, event):
@@ -316,9 +424,17 @@ class MainWindow(QMainWindow):
         self.qs.setValue("auto_title", "true" if self.auto_title_action.isChecked() else "false")
         self.qs.setValue("font_size", self.view.font().pointSize())
         self.qs.setValue("last_model", self.model_combo.currentText())
+        self.qs.setValue("monitor", "true" if self.monitor_action.isChecked() else "false")
+        self.qs.setValue("last_project", str(self.project.root) if self.project else "")
+        if self.monitor:
+            self.monitor.stop()
+            self.monitor.wait(3000)
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
+        for w in (self.prepare_worker, self.index_worker):
+            if w and w.isRunning():
+                w.wait(3000)
         self.db.close()
         super().closeEvent(event)
 
@@ -417,7 +533,9 @@ class MainWindow(QMainWindow):
         self.chat_id = None
         self.messages = []
         self.attachments = []
+        self.last_info = None
         self._update_attach_label()
+        self._update_context_label()
         self.chat_list.clearSelection()
         self.system_edit.blockSignals(True)
         self.system_edit.setPlainText(self.default_system)
@@ -443,6 +561,14 @@ class MainWindow(QMainWindow):
             self.model_combo.blockSignals(True)
             self.model_combo.setCurrentText(chat["model"])
             self.model_combo.blockSignals(False)
+        self.last_info = None
+        proj = chat["project"]
+        if proj and Path(proj).is_dir():
+            if not self.project or str(self.project.root) != str(Path(proj).resolve()):
+                self.set_project(proj, persist=False)
+        elif self.project:
+            self._drop_project()
+        self._update_context_label()
         self._render(scroll_bottom=True)
 
     def _chat_context_menu(self, pos):
@@ -519,12 +645,18 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ sending
     def _busy(self) -> bool:
-        if self.worker and self.worker.isRunning():
+        if (self.worker and self.worker.isRunning()) or \
+                (self.prepare_worker and self.prepare_worker.isRunning()):
             self.status_label.setText("Wait for the reply to finish, or press Stop.")
             return True
         return False
 
     def send_or_stop(self):
+        if self.prepare_worker and self.prepare_worker.isRunning():
+            self._cancel_prepare = True
+            self.send_btn.setEnabled(False)
+            self.status_label.setText("Stopping…")
+            return
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.send_btn.setEnabled(False)
@@ -546,7 +678,8 @@ class MainWindow(QMainWindow):
         if self.chat_id is None:
             title = (text or self.attachments[0].name).splitlines()[0][:40]
             self.chat_id = self.db.create_chat(
-                model=model, system_prompt=self.system_edit.toPlainText(), title=title)
+                model=model, system_prompt=self.system_edit.toPlainText(), title=title,
+                project=str(self.project.root) if self.project else "")
             self.reload_chat_list()
         self.db.add_message(self.chat_id, "user", content)
         self.messages.append(("user", content))
@@ -565,27 +698,45 @@ class MainWindow(QMainWindow):
             return
         self._start_generation(self.model_combo.currentText())
 
-    def _api_messages(self) -> list[dict]:
-        msgs = []
-        system = self.system_edit.toPlainText().strip()
-        if system:
-            msgs.append({"role": "system", "content": system})
-        msgs += [{"role": r, "content": c} for r, c in self.messages]
-        return msgs
-
     def _start_generation(self, model: str):
         self.streaming_text = ""
         self.ollama_error = None
         self.token_count = 0
         self.t_start = time.time()
+        self._cancel_prepare = False
+        self.pending_model = model
         self._set_generating(True)
+        self.status_label.setText("Reading project…" if self.project else "Generating…")
+        self.prepare_worker = PrepareWorker(
+            self.project, self.system_edit.toPlainText(), list(self.messages), self.num_ctx())
+        self.prepare_worker.ready.connect(self._on_prepared)
+        self.prepare_worker.failed.connect(self._on_prepare_failed)
+        self.prepare_worker.start()
+        self._render(scroll_bottom=True)
+
+    def _on_prepared(self, msgs: list, info: dict):
+        if self._cancel_prepare:
+            self.streaming_text = None
+            self._set_generating(False)
+            self.status_label.setText("Stopped")
+            self._render()
+            return
+        self.last_info = info
+        self._update_context_label()
         options = {"temperature": self.temperature(), "num_ctx": self.num_ctx()}
-        self.worker = ChatWorker(model, self._api_messages(), options, self.host)
+        self.worker = ChatWorker(self.pending_model, msgs, options, self.host)
         self.worker.token.connect(self._on_token)
         self.worker.finished_ok.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
-        self._render(scroll_bottom=True)
+        self.status_label.setText("Generating…")
+
+    def _on_prepare_failed(self, err: str):
+        self.streaming_text = None
+        self._set_generating(False)
+        self.ollama_error = f"Could not prepare the request: {err}"
+        self.status_label.setText("Error while reading project")
+        self._render()
 
     def _set_generating(self, on: bool):
         self.send_btn.setText("Stop" if on else "Send")
@@ -636,6 +787,166 @@ class MainWindow(QMainWindow):
             self._render()
         self.status_label.setText("Error: " + err.splitlines()[0][:120])
 
+    # ------------------------------------------------------------ project
+    def open_project_dialog(self):
+        if self._busy():
+            return
+        start = str(self.project.root.parent) if self.project else str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "Choose project folder", start)
+        if path:
+            self.set_project(path)
+
+    def set_project(self, path: str, persist: bool = True):
+        p = Path(path)
+        if not p.is_dir():
+            self.status_label.setText(f"Folder not found: {path}")
+            return
+        self.project = Project(p)
+        self.last_info = None
+        self.project_btn.setText(f"Project: {self.project.name}")
+        self.project_btn.setToolTip(str(self.project.root))
+        if persist and self.chat_id is not None:
+            self.db.update_chat(self.chat_id, project=str(self.project.root))
+        self._start_index()
+
+    def _start_index(self):
+        if not self.project:
+            return
+        proj = self.project
+        self.context_label.setText(f"Scanning {proj.name}…")
+        self.context_label.setVisible(True)
+        self.index_worker = IndexWorker(proj)
+        self.index_worker.done.connect(lambda n, proj=proj: self._on_indexed(proj, n))
+        self.index_worker.failed.connect(lambda e: self.status_label.setText("Project scan failed: " + e))
+        self.index_worker.start()
+
+    def _on_indexed(self, proj: Project, n: int):
+        if proj is self.project:
+            self._update_context_label()
+            self.status_label.setText(f"Project {proj.name}: {n} files indexed")
+
+    def rescan_project(self):
+        if self.project and not self._busy():
+            self._start_index()
+
+    def close_project(self):
+        if self._busy():
+            return
+        if self.chat_id is not None:
+            self.db.update_chat(self.chat_id, project="")
+        self._drop_project()
+
+    def _drop_project(self):
+        self.project = None
+        self.last_info = None
+        self.project_btn.setText("Project: none")
+        self.project_btn.setToolTip("Give the model your code")
+        self._update_context_label()
+
+    def _update_context_label(self):
+        proj = self.project
+        if not proj:
+            self.context_label.setVisible(False)
+            return
+        if proj.file_count == 0:
+            self.context_label.setText(
+                f"Project {proj.name}: no readable code files found in this folder.")
+            self.context_label.setToolTip("")
+            self.context_label.setVisible(True)
+            return
+        text = f"Project {proj.name}: {proj.file_count} files (~{proj.total_tokens / 1000:.0f}k tokens)"
+        notes = []
+        if proj.skipped_large:
+            notes.append(f"{proj.skipped_large} large files skipped")
+        if proj.truncated:
+            notes.append("folder too big, only part indexed")
+        info = self.last_info
+        tip = ""
+        if info:
+            nf = len(info["files"])
+            text += (f"  ·  last question used {info['chunks']} snippet{'s' if info['chunks'] != 1 else ''} "
+                     f"from {nf} file{'s' if nf != 1 else ''} "
+                     f"(~{info['project_tokens'] / 1000:.1f}k of {info['num_ctx'] // 1024}k tokens)")
+            if info["history_dropped"]:
+                notes.append(f"{info['history_dropped']} older messages left out to fit")
+            tip = "Files used:\n" + "\n".join(info["files"]) if info["files"] else ""
+        if notes:
+            text += "  ·  " + ", ".join(notes)
+        self.context_label.setText(text)
+        self.context_label.setToolTip(tip)
+        self.context_label.setVisible(True)
+
+    # ------------------------------------------------------------ monitor
+    def _set_monitor(self, on: bool):
+        if on and not self.monitor:
+            self.monitor = SystemMonitor(self.host, 2.0)
+            self.monitor.stats.connect(self._on_stats)
+            self.monitor.start()
+        elif not on and self.monitor:
+            self.monitor.stop()
+            self.monitor.wait(3000)
+            self.monitor = None
+            self.sys_label.setText("")
+            for lbl, bar in self.sys_widgets.values():
+                lbl.setText("monitor off")
+                bar.setValue(0)
+            self.sys_model_label.setText("")
+
+    def _set_bar(self, key: str, text: str, pct: float, color: str):
+        lbl, bar = self.sys_widgets[key]
+        lbl.setText(text)
+        bar.setValue(int(max(0, min(100, pct))))
+        if self._bar_colors.get(key) != color:
+            self._bar_colors[key] = color
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}")
+
+    @staticmethod
+    def _temp_html(t: float | None, warn: float, hot: float) -> str:
+        if t is None:
+            return '<span style="color:#8b93a1;">temp n/a</span>'
+        return f'<span style="color:{level_color(t, warn, hot)};">{t:.0f}°C</span>'
+
+    def _on_stats(self, st: dict):
+        self._set_bar("ram", f"RAM  {st['ram_used']:.1f} / {st['ram_total']:.1f} GB  ({st['ram_pct']:.0f}%)",
+                      st["ram_pct"], level_color(st["ram_pct"], 80, 92))
+        cpu_t = st["cpu_temp"]
+        self._set_bar("cpu", f"CPU  {st['cpu_pct']:.0f}%  ·  {self._temp_html(cpu_t, 85, 95)}",
+                      st["cpu_pct"], level_color(st["cpu_pct"], 85, 97))
+        g = st["gpu"]
+        compact = f"RAM {st['ram_pct']:.0f}%  ·  CPU {st['cpu_pct']:.0f}%"
+        if cpu_t is not None:
+            compact += f" {cpu_t:.0f}°C"
+        if g:
+            util = g["util"] or 0
+            power = f"  ·  {g['power']:.0f} W" if g.get("power") else ""
+            self._set_bar("gpu", f"GPU  {util:.0f}%  ·  {self._temp_html(g['temp'], 78, 87)}{power}",
+                          util, level_color(util, 85, 97))
+            if g["mem_total"]:
+                pct = 100 * (g["mem_used"] or 0) / g["mem_total"]
+                self._set_bar("vram", f"VRAM  {(g['mem_used'] or 0) / 1024:.1f} / {g['mem_total'] / 1024:.1f} GB",
+                              pct, level_color(pct, 85, 95))
+                compact += f"  ·  GPU {util:.0f}%"
+                if g["temp"] is not None:
+                    compact += f" {g['temp']:.0f}°C"
+                compact += f"  ·  VRAM {(g['mem_used'] or 0) / 1024:.1f}/{g['mem_total'] / 1024:.1f} GB"
+        else:
+            self._set_bar("gpu", "GPU  not detected (nvidia-smi not found)", 0, GREEN)
+            self._set_bar("vram", "VRAM  n/a", 0, GREEN)
+        self.sys_label.setText(compact)
+
+        models = st.get("ollama") or []
+        if models:
+            lines = []
+            for m in models:
+                gpu_pct = m["gpu_pct"]
+                where = ("all on GPU" if gpu_pct >= 100 else
+                         "all on CPU (slow)" if gpu_pct == 0 else
+                         f"{gpu_pct}% GPU / {100 - gpu_pct}% CPU (slower)")
+                lines.append(f"Loaded: <b>{m['name']}</b>, {where}")
+            self.sys_model_label.setText("<br>".join(lines))
+        else:
+            self.sys_model_label.setText("No model loaded in Ollama yet (it loads on your first message).")
+
     # ----------------------------------------------------------- rendering
     def _render(self, scroll_bottom: bool = False):
         sb = self.view.verticalScrollBar()
@@ -668,6 +979,7 @@ class MainWindow(QMainWindow):
             "<p>Ask a coding question, paste an error, or use <b>Attach file</b> to share a source file.</p>"
             "<ul><li>Pick a model above (1.5b is fast, 7b is smarter)</li>"
             "<li>Use <b>Settings</b> for the system prompt, temperature and context length</li>"
+            "<li>Click <b>Project</b> to point at a code folder; relevant files are added to each question</li>"
             "<li>Click <b>Copy</b> on any code block to copy it</li></ul>"
             f"{msg}</body></html>"
         )

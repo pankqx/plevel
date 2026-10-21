@@ -77,6 +77,10 @@ QSlider::handle:horizontal {{
 }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
 
+QProgressBar {{ background-color: {BORDER}; border: none; border-radius: 4px; }}
+QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 4px; }}
+QPushButton::menu-indicator {{ subcontrol-position: right center; right: 6px; }}
+
 QScrollBar:vertical {{ background: {BG}; width: 10px; margin: 0; }}
 QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 5px; min-height: 30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}

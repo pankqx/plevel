@@ -42,14 +42,19 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        cols = [r["name"] for r in self.conn.execute("PRAGMA table_info(chats)")]
+        if "project" not in cols:  # migrate older databases
+            self.conn.execute("ALTER TABLE chats ADD COLUMN project TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
     # ---- chats -------------------------------------------------------
-    def create_chat(self, model: str = "", system_prompt: str = "", title: str = "New chat") -> int:
+    def create_chat(self, model: str = "", system_prompt: str = "", title: str = "New chat",
+                    project: str = "") -> int:
         now = time.time()
         cur = self.conn.execute(
-            "INSERT INTO chats (title, model, system_prompt, created, updated) VALUES (?,?,?,?,?)",
-            (title, model, system_prompt, now, now),
+            "INSERT INTO chats (title, model, system_prompt, project, created, updated) "
+            "VALUES (?,?,?,?,?,?)",
+            (title, model, system_prompt, project, now, now),
         )
         self.conn.commit()
         return int(cur.lastrowid)
@@ -70,7 +75,7 @@ class Database:
         return self.conn.execute("SELECT * FROM chats WHERE id = ?", (chat_id,)).fetchone()
 
     def update_chat(self, chat_id: int, **fields) -> None:
-        allowed = {"title", "model", "system_prompt"}
+        allowed = {"title", "model", "system_prompt", "project"}
         cols = [k for k in fields if k in allowed]
         if not cols:
             return
