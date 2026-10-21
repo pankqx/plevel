@@ -63,7 +63,7 @@ What to expect:
 
 - **It does not read the whole project.** It sees a few thousand tokens of the most relevant code per question. Mention file or function names for better results.
 - **It re-reads your files from disk on every question**, so edits you make are picked up immediately. Nothing is "learned" or remembered between questions beyond the chat history.
-- **The context length slider matters.** At 8192 tokens roughly 3,500 tokens (about 12 KB of code) go to project snippets; at 16384 about twice that. Bigger windows use more VRAM/RAM and make the first reply slower.
+- **The context length slider matters.** At 8192 tokens roughly 3,500 tokens (about 12 KB of code) go to project snippets; at 16384 about 8,000. Bigger windows use more VRAM/RAM and make the first reply slower.
 - Each chat remembers its project folder, and the last project is reopened at startup.
 - Matching is keyword-based, not semantic: if your question shares no words with the code, the right file can be missed. Name the file or function.
 
