@@ -41,7 +41,7 @@ context:
 Switch the model in the Continue chat box dropdown. Older Continue versions use `config.json`; the extension offers to migrate.
 
 ## 4. Stay offline and private
-- VS Code settings → search `continue telemetry` → turn it off.
+- Continue settings (gear icon in the Continue panel) → turn off **Allow Anonymous Telemetry**. (A VS Code settings search for "continue telemetry" may find nothing in newer versions.)
 - Do not sign in to Continue Hub; use only the local config above.
 - Check: disconnect Wi-Fi, ask a question in chat. It should still answer.
 
@@ -55,6 +55,7 @@ Switch the model in the Continue chat box dropdown. Older Continue versions use 
 - **Complex (many files):** open the repo as the VS Code folder, ask with `@codebase`, and name files with `@file`. Small models lose track across many files, so ask about one feature or file at a time and give the error text.
 
 ## 7. Test plan: what can Continue do?
+Use **Chat** mode (the mode dropdown at the bottom of the Continue box), not Agent. With small local models, Agent mode often prints raw tool-call JSON like `{"name": "read_currently_open_file"}` instead of answering. That is the model failing at tool calling, not a broken setup.
 Run these in order in a scratch folder; note PASS/FAIL and speed.
 
 1. **Autocomplete:** create `t.py`, type `def is_prime(n):` and pause. Does a sensible body appear? Tab accepts.
