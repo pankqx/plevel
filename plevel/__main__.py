@@ -4,14 +4,15 @@ from PySide6.QtWidgets import QApplication
 
 from . import APP_NAME
 from .main_window import MainWindow
-from .theme import STYLESHEET
+from . import theme
 
 
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setDesktopFileName("plevel")
-    app.setStyleSheet(STYLESHEET)
+    theme.load_fonts()
+    app.setStyleSheet(theme.stylesheet())
     win = MainWindow()
     win.show()
     return app.exec()

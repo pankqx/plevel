@@ -1,33 +1,31 @@
-"""Main window: history sidebar, chat view, input box, settings panel."""
+"""Main window: sidebar (history + live monitor), chat column, composer, settings drawer."""
 
 from __future__ import annotations
 
-import os
 import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
-    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSplitter,
-    QTextBrowser, QVBoxLayout, QWidget,
+    QComboBox, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QSlider, QVBoxLayout, QWidget,
 )
 
-from . import APP_NAME, __version__
+from . import APP_NAME, __version__, theme
+from .chat_view import COLUMN_MAX, AvatarLabel, ChatView
 from .context import Project, build_messages
 from .db import Database
 from .monitor import SystemMonitor
-from .ollama_client import (
-    DEFAULT_HOST, ChatWorker, ModelListWorker, TitleWorker,
-)
-from .render import render_conversation
+from .ollama_client import DEFAULT_HOST, ChatWorker, ModelListWorker, TitleWorker
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are an expert programming assistant helping a developer with their own projects. "
     "Be concise and practical. Give working code in fenced code blocks with the language "
-    "named, explain only what is needed, and point out bugs or risks you notice."
+    "named, explain only what is needed, and point out bugs or risks you notice. "
+    "If you are not sure something exists (a function, a library, a file), say so instead of guessing."
 )
 
 SYSTEM_PRESETS = {
@@ -49,6 +47,10 @@ SYSTEM_PRESETS = {
         "You are a patient Python tutor. Explain step by step with small examples and "
         "finish with one short exercise."
     ),
+    "Technical writer": (
+        "You write clear project documentation (README, design docs, specs). Use headings and "
+        "short paragraphs. Ask one or two clarifying questions first if key details are missing."
+    ),
 }
 
 MAX_ATTACH_BYTES = 200_000
@@ -60,8 +62,7 @@ LANG_BY_EXT = {
     ".xml": "xml", ".php": "php", ".rb": "ruby", ".swift": "swift", ".toml": "toml",
 }
 
-
-GREEN, AMBER, RED = "#5fd38d", "#f0b429", "#ef6b6b"
+GREEN, AMBER, RED = theme.GREEN, theme.AMBER, theme.DANGER
 
 
 def level_color(pct: float | None, warn: float = 75, hot: float = 90) -> str:
@@ -70,6 +71,7 @@ def level_color(pct: float | None, warn: float = 75, hot: float = 90) -> str:
     return RED if pct >= hot else AMBER if pct >= warn else GREEN
 
 
+# ------------------------------------------------------------ workers
 class PrepareWorker(QThread):
     """Rescans the project and builds the final message list off the UI thread."""
 
@@ -108,14 +110,26 @@ class IndexWorker(QThread):
             self.failed.emit(str(exc))
 
 
+# ------------------------------------------------------------- composer
 class InputBox(QPlainTextEdit):
-    """Enter sends, Shift+Enter inserts a newline."""
+    """Grows with its text. Enter sends, Shift+Enter inserts a newline."""
+
+    focus_changed = Signal(bool)
 
     def __init__(self, on_send):
         super().__init__()
+        self.setObjectName("composerEdit")
         self._on_send = on_send
-        self.setPlaceholderText("Ask about your code…  (Enter to send, Shift+Enter for a new line)")
-        self.setFixedHeight(84)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setPlaceholderText("Ask anything about your code…   (Enter to send, Shift+Enter for a new line)")
+        self.document().documentLayout().documentSizeChanged.connect(self._fit)
+        self._fit()
+
+    def _fit(self, *_):
+        lines = max(1.0, self.document().size().height())
+        h = int(lines * self.fontMetrics().lineSpacing() + self.document().documentMargin() * 2 + 6)
+        self.setFixedHeight(max(34, min(h, 220)))
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
@@ -123,12 +137,35 @@ class InputBox(QPlainTextEdit):
             return
         super().keyPressEvent(event)
 
+    def focusInEvent(self, e):
+        self.focus_changed.emit(True)
+        super().focusInEvent(e)
+
+    def focusOutEvent(self, e):
+        self.focus_changed.emit(False)
+        super().focusOutEvent(e)
+
+
+def _centered(widget: QWidget, max_width: int = COLUMN_MAX) -> QWidget:
+    """Put a widget in a column that lines up with the chat column."""
+    host = QWidget()
+    lay = QHBoxLayout(host)
+    lay.setContentsMargins(30, 0, 30, 0)
+    widget.setMaximumWidth(max_width)
+    lay.addStretch(1)
+    lay.addWidget(widget, 100)
+    lay.addStretch(1)
+    return host
+
 
 class MainWindow(QMainWindow):
+    reply_done = Signal(str, float, str)   # answer text, tokens/second, model name
+
     def __init__(self, db: Database | None = None):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(1280, 800)
+        self.setWindowTitle(f"{APP_NAME}")
+        self.resize(1360, 860)
+        self.setMinimumSize(900, 600)
 
         self.db = db or Database()
         self.qs = QSettings("plevel", "plevel")
@@ -136,7 +173,6 @@ class MainWindow(QMainWindow):
 
         self.chat_id: int | None = None
         self.messages: list[tuple[str, str]] = []
-        self.codes: list[str] = []
         self.attachments: list[Path] = []
         self.worker: ChatWorker | None = None
         self.model_worker: ModelListWorker | None = None
@@ -150,10 +186,12 @@ class MainWindow(QMainWindow):
         self.index_worker: IndexWorker | None = None
         self.prepare_worker: PrepareWorker | None = None
         self.monitor: SystemMonitor | None = None
+        self.testdrive = None
         self.pending_model = ""
         self.last_info: dict | None = None
         self._cancel_prepare = False
         self._bar_colors: dict[str, str] = {}
+        self.last_stats: dict | None = None
 
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
@@ -168,47 +206,48 @@ class MainWindow(QMainWindow):
         last = self.qs.value("last_project", "")
         if last and Path(last).is_dir():
             self.set_project(last, persist=False)
+        self._update_title()
         self._render()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_sidebar())
-        splitter.addWidget(self._build_center())
-        splitter.addWidget(self._build_settings_panel())
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([260, 780, 280])
-        self.setCentralWidget(splitter)
-        self.status_label = QLabel("")
-        self.statusBar().addWidget(self.status_label, 1)
-        self.sys_label = QLabel("")
-        self.statusBar().addPermanentWidget(self.sys_label)
+        root = QWidget()
+        h = QHBoxLayout(root)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+        h.addWidget(self._build_sidebar())
+        h.addWidget(self._build_center(), 1)
+        h.addWidget(self._build_drawer())
+        self.setCentralWidget(root)
+        self.statusBar().hide()
 
     def _build_sidebar(self) -> QWidget:
         side = QFrame()
         side.setObjectName("sidebar")
-        side.setMinimumWidth(200)
-        side.setMaximumWidth(380)
+        side.setFixedWidth(272)
         lay = QVBoxLayout(side)
-        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setContentsMargins(14, 16, 14, 14)
+        lay.setSpacing(10)
 
-        title = QLabel(APP_NAME)
-        title.setObjectName("heading")
-        f = title.font()
-        f.setPointSize(f.pointSize() + 3)
-        title.setFont(f)
-        lay.addWidget(title)
+        brand = QHBoxLayout()
+        brand.setSpacing(10)
+        brand.addWidget(AvatarLabel("P", 30))
+        name = QLabel(APP_NAME)
+        name.setObjectName("title")
+        name.setStyleSheet("font-size: 17px;")
+        brand.addWidget(name)
+        brand.addStretch(1)
+        lay.addLayout(brand)
+        lay.addSpacing(6)
 
-        new_btn = QPushButton("+  New chat")
+        new_btn = QPushButton("＋   New chat")
         new_btn.setObjectName("primary")
+        new_btn.setCursor(Qt.PointingHandCursor)
         new_btn.clicked.connect(self.new_chat)
         lay.addWidget(new_btn)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search chats…")
+        self.search_box.setPlaceholderText("Search chats")
         self.search_box.textChanged.connect(self.reload_chat_list)
         lay.addWidget(self.search_box)
 
@@ -219,27 +258,68 @@ class MainWindow(QMainWindow):
         self.chat_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.chat_list.customContextMenuRequested.connect(self._chat_context_menu)
         lay.addWidget(self.chat_list, 1)
+
+        # ---- live system monitor -------------------------------------
+        sec = QLabel("SYSTEM · LIVE")
+        sec.setObjectName("section")
+        lay.addWidget(sec)
+        self.sys_widgets: dict[str, tuple[QLabel, QProgressBar]] = {}
+        for key in ("ram", "cpu", "gpu", "vram"):
+            lbl = QLabel("…")
+            lbl.setObjectName("tiny")
+            lbl.setTextFormat(Qt.RichText)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(4)
+            box = QVBoxLayout()
+            box.setSpacing(3)
+            box.addWidget(lbl)
+            box.addWidget(bar)
+            lay.addLayout(box)
+            self.sys_widgets[key] = (lbl, bar)
+        self.sys_model_label = QLabel("")
+        self.sys_model_label.setObjectName("tiny")
+        self.sys_model_label.setWordWrap(True)
+        self.sys_model_label.setTextFormat(Qt.RichText)
+        lay.addWidget(self.sys_model_label)
+        self.sys_label = QLabel("")   # compact one-liner, kept for tooltips and tests
+        self.sys_label.setVisible(False)
+        lay.addWidget(self.sys_label)
         return side
 
     def _build_center(self) -> QWidget:
         center = QWidget()
+        center.setObjectName("canvas")
         lay = QVBoxLayout(center)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        top = QWidget()
-        top_l = QHBoxLayout(top)
-        top_l.setContentsMargins(12, 8, 12, 8)
-        top_l.addWidget(QLabel("Model"))
+        # ---- header ---------------------------------------------------
+        head = QWidget()
+        head.setObjectName("header")
+        hl = QHBoxLayout(head)
+        hl.setContentsMargins(26, 14, 20, 8)
+        hl.setSpacing(8)
+        self.title_label = QLabel("New chat")
+        self.title_label.setObjectName("title")
+        hl.addWidget(self.title_label, 1)
+
         self.model_combo = QComboBox()
-        self.model_combo.setMinimumWidth(220)
+        self.model_combo.setMinimumWidth(210)
+        self.model_combo.setToolTip("Which local model answers")
         self.model_combo.currentTextChanged.connect(self._on_model_changed)
-        top_l.addWidget(self.model_combo)
-        refresh = QPushButton("Refresh")
+        hl.addWidget(self.model_combo)
+        refresh = QPushButton("⟳")
+        refresh.setObjectName("icon")
         refresh.setToolTip("Re-read the installed models from Ollama")
+        refresh.setCursor(Qt.PointingHandCursor)
         refresh.clicked.connect(self.refresh_models)
-        top_l.addWidget(refresh)
+        hl.addWidget(refresh)
+
         self.project_btn = QPushButton("Project: none")
+        self.project_btn.setObjectName("pill")
+        self.project_btn.setCursor(Qt.PointingHandCursor)
         self.project_btn.setToolTip("Give the model your code: it reads the folder and picks "
                                     "the files relevant to each question")
         pmenu = QMenu(self)
@@ -247,79 +327,110 @@ class MainWindow(QMainWindow):
         pmenu.addAction("Re-scan project", self.rescan_project)
         pmenu.addAction("Close project", self.close_project)
         self.project_btn.setMenu(pmenu)
-        top_l.addWidget(self.project_btn)
-        top_l.addStretch(1)
-        self.regen_btn = QPushButton("Regenerate")
+        hl.addWidget(self.project_btn)
+
+        self.regen_btn = QPushButton("↻")
+        self.regen_btn.setObjectName("icon")
+        self.regen_btn.setToolTip("Regenerate the last answer")
+        self.regen_btn.setCursor(Qt.PointingHandCursor)
         self.regen_btn.clicked.connect(self.regenerate)
-        top_l.addWidget(self.regen_btn)
-        self.settings_btn = QPushButton("Settings")
+        hl.addWidget(self.regen_btn)
+        self.settings_btn = QPushButton("⚙")
+        self.settings_btn.setObjectName("icon")
+        self.settings_btn.setToolTip("Settings: system prompt, temperature, context length")
         self.settings_btn.setCheckable(True)
-        self.settings_btn.setChecked(True)
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
         self.settings_btn.clicked.connect(self._toggle_settings)
-        top_l.addWidget(self.settings_btn)
-        lay.addWidget(top)
+        hl.addWidget(self.settings_btn)
+        lay.addWidget(head)
 
-        self.view = QTextBrowser()
-        self.view.setObjectName("chat")
-        self.view.setOpenLinks(False)
-        self.view.setOpenExternalLinks(False)
-        self.view.anchorClicked.connect(self._on_anchor)
-        lay.addWidget(self.view, 1)
+        # ---- conversation ---------------------------------------------
+        self.chat = ChatView(14)
+        self.chat.prompt_chosen.connect(self._use_prompt)
+        self.chat.regenerate_requested.connect(self.regenerate)
+        self.chat.testdrive_requested.connect(self.open_testdrive)
+        lay.addWidget(self.chat, 1)
 
-        bottom = QWidget()
-        b_l = QVBoxLayout(bottom)
-        b_l.setContentsMargins(12, 8, 12, 12)
+        # ---- composer -------------------------------------------------
+        foot = QWidget()
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(0, 4, 0, 14)
+        fl.setSpacing(6)
+
         self.attach_label = QLabel("")
         self.attach_label.setObjectName("muted")
         self.attach_label.setVisible(False)
-        b_l.addWidget(self.attach_label)
+        fl.addWidget(_centered(self.attach_label))
         self.context_label = QLabel("")
         self.context_label.setObjectName("muted")
         self.context_label.setWordWrap(True)
         self.context_label.setVisible(False)
-        b_l.addWidget(self.context_label)
+        fl.addWidget(_centered(self.context_label))
 
-        row = QHBoxLayout()
+        self.composer = QFrame()
+        self.composer.setObjectName("composer")
+        cl = QVBoxLayout(self.composer)
+        cl.setContentsMargins(16, 10, 10, 10)
+        cl.setSpacing(6)
         self.input = InputBox(self.send_or_stop)
-        row.addWidget(self.input, 1)
-        btns = QVBoxLayout()
-        self.attach_btn = QPushButton("Attach file")
+        self.input.focus_changed.connect(self._composer_focus)
+        cl.addWidget(self.input)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.attach_btn = QPushButton("＋  Attach file")
+        self.attach_btn.setObjectName("attach")
+        self.attach_btn.setCursor(Qt.PointingHandCursor)
         self.attach_btn.setToolTip("Add a code file to your next message")
         self.attach_btn.clicked.connect(self.attach_files)
-        btns.addWidget(self.attach_btn)
-        self.send_btn = QPushButton("Send")
-        self.send_btn.setObjectName("primary")
+        row.addWidget(self.attach_btn)
+        row.addStretch(1)
+        self.send_btn = QPushButton("↑")
+        self.send_btn.setObjectName("send")
+        self.send_btn.setFixedSize(38, 38)
+        self.send_btn.setCursor(Qt.PointingHandCursor)
+        self.send_btn.setToolTip("Send (Enter)")
         self.send_btn.clicked.connect(self.send_or_stop)
-        btns.addWidget(self.send_btn)
-        row.addLayout(btns)
-        b_l.addLayout(row)
-        lay.addWidget(bottom)
+        row.addWidget(self.send_btn)
+        cl.addLayout(row)
+        fl.addWidget(_centered(self.composer))
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("tiny")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        fl.addWidget(self.status_label)
+        lay.addWidget(foot)
         return center
 
-    def _build_settings_panel(self) -> QWidget:
+    def _build_drawer(self) -> QWidget:
         self.settings_panel = QFrame()
-        self.settings_panel.setObjectName("settings")
-        self.settings_panel.setMinimumWidth(240)
-        self.settings_panel.setMaximumWidth(380)
+        self.settings_panel.setObjectName("drawer")
+        self.settings_panel.setFixedWidth(310)
+        self.settings_panel.setVisible(False)
         lay = QVBoxLayout(self.settings_panel)
-        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setContentsMargins(18, 18, 18, 16)
+        lay.setSpacing(8)
 
         h = QLabel("Settings")
-        h.setObjectName("heading")
+        h.setObjectName("title")
         lay.addWidget(h)
+        lay.addSpacing(4)
 
-        lay.addWidget(QLabel("System prompt"))
+        sec = QLabel("SYSTEM PROMPT")
+        sec.setObjectName("section")
+        lay.addWidget(sec)
         self.preset_combo = QComboBox()
-        self.preset_combo.addItem("Presets…")
+        self.preset_combo.addItem("Choose a preset…")
         self.preset_combo.addItems(SYSTEM_PRESETS.keys())
         self.preset_combo.currentIndexChanged.connect(self._on_preset)
         lay.addWidget(self.preset_combo)
         self.system_edit = QPlainTextEdit()
+        self.system_edit.setObjectName("sysedit")
         self.system_edit.setPlaceholderText("Instructions the model follows in this chat")
-        self.system_edit.setMinimumHeight(110)
+        self.system_edit.setMinimumHeight(150)
         self.system_edit.textChanged.connect(self._on_system_changed)
-        lay.addWidget(self.system_edit)
+        lay.addWidget(self.system_edit, 1)
 
+        lay.addSpacing(6)
         self.temp_label = QLabel()
         lay.addWidget(self.temp_label)
         self.temp_slider = QSlider(Qt.Horizontal)
@@ -331,49 +442,28 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         lay.addWidget(hint)
 
+        lay.addSpacing(6)
         self.ctx_label = QLabel()
         lay.addWidget(self.ctx_label)
         self.ctx_slider = QSlider(Qt.Horizontal)
         self.ctx_slider.setRange(2, 32)  # x1024
         self.ctx_slider.valueChanged.connect(self._on_ctx)
         lay.addWidget(self.ctx_slider)
-        hint2 = QLabel("Bigger = remembers more code, uses more RAM")
+        hint2 = QLabel("Bigger = sees more of your code, but uses more memory and starts answering later")
         hint2.setObjectName("muted")
         hint2.setWordWrap(True)
         lay.addWidget(hint2)
 
         lay.addSpacing(10)
-        sh = QLabel("System (live)")
-        sh.setObjectName("heading")
-        lay.addWidget(sh)
-        self.sys_widgets: dict[str, tuple[QLabel, QProgressBar]] = {}
-        for key in ("ram", "cpu", "gpu", "vram"):
-            lbl = QLabel("…")
-            lbl.setTextFormat(Qt.RichText)
-            bar = QProgressBar()
-            bar.setRange(0, 100)
-            bar.setTextVisible(False)
-            bar.setFixedHeight(8)
-            lay.addWidget(lbl)
-            lay.addWidget(bar)
-            self.sys_widgets[key] = (lbl, bar)
-        self.sys_model_label = QLabel("")
-        self.sys_model_label.setObjectName("muted")
-        self.sys_model_label.setWordWrap(True)
-        self.sys_model_label.setTextFormat(Qt.RichText)
-        lay.addWidget(self.sys_model_label)
-
-        lay.addStretch(1)
-        host = QLabel(f"Ollama: {self.host}")
-        host.setObjectName("muted")
+        host = QLabel(f"Ollama at {self.host}")
+        host.setObjectName("tiny")
         lay.addWidget(host)
         return self.settings_panel
 
     def _build_menu(self):
         mb = self.menuBar()
         file_menu = mb.addMenu("&File")
-        act = QAction("New chat", self, shortcut=QKeySequence.New, triggered=self.new_chat)
-        file_menu.addAction(act)
+        file_menu.addAction(QAction("New chat", self, shortcut=QKeySequence.New, triggered=self.new_chat))
         file_menu.addAction(QAction("Open project folder…", self, shortcut="Ctrl+Shift+O",
                                     triggered=self.open_project_dialog))
         file_menu.addAction(QAction("Attach file…", self, shortcut="Ctrl+O", triggered=self.attach_files))
@@ -384,7 +474,8 @@ class MainWindow(QMainWindow):
 
         view_menu = mb.addMenu("&View")
         view_menu.addAction(QAction("Focus input", self, shortcut="Ctrl+L", triggered=self.input.setFocus))
-        view_menu.addAction(QAction("Toggle settings panel", self, shortcut="Ctrl+,",
+        view_menu.addAction(QAction("Stop generating", self, shortcut="Esc", triggered=self._escape))
+        view_menu.addAction(QAction("Toggle settings", self, shortcut="Ctrl+,",
                                     triggered=lambda: self._toggle_settings(not self.settings_panel.isVisible())))
         view_menu.addAction(QAction("Bigger text", self, shortcut="Ctrl+=", triggered=lambda: self._zoom(1)))
         view_menu.addAction(QAction("Smaller text", self, shortcut="Ctrl+-", triggered=lambda: self._zoom(-1)))
@@ -399,6 +490,7 @@ class MainWindow(QMainWindow):
         opts.addAction(self.monitor_action)
 
         help_menu = mb.addMenu("&Help")
+        help_menu.addAction(QAction("Model test drive…", self, shortcut="Ctrl+T", triggered=self.open_testdrive))
         help_menu.addAction(QAction("About", self, triggered=self._about))
 
     # ----------------------------------------------------------- settings
@@ -414,7 +506,7 @@ class MainWindow(QMainWindow):
         self.system_edit.setPlainText(self.default_system)
         self.auto_title_action.setChecked(self.qs.value("auto_title", "false") == "true")
         self.monitor_action.setChecked(self.qs.value("monitor", "true") == "true")
-        self.view.setFont(QFont(self.view.font().family(), int(self.qs.value("font_size", 11))))
+        self.chat.base_px = int(self.qs.value("font_px", 14))
 
     def closeEvent(self, event):
         self.qs.setValue("geometry", self.saveGeometry())
@@ -422,10 +514,12 @@ class MainWindow(QMainWindow):
         self.qs.setValue("num_ctx", self.num_ctx())
         self.qs.setValue("system_prompt", self.system_edit.toPlainText())
         self.qs.setValue("auto_title", "true" if self.auto_title_action.isChecked() else "false")
-        self.qs.setValue("font_size", self.view.font().pointSize())
+        self.qs.setValue("font_px", self.chat.base_px)
         self.qs.setValue("last_model", self.model_combo.currentText())
         self.qs.setValue("monitor", "true" if self.monitor_action.isChecked() else "false")
         self.qs.setValue("last_project", str(self.project.root) if self.project else "")
+        if self.testdrive:
+            self.testdrive.close()
         if self.monitor:
             self.monitor.stop()
             self.monitor.wait(3000)
@@ -445,10 +539,10 @@ class MainWindow(QMainWindow):
         return self.ctx_slider.value() * 1024
 
     def _on_temp(self, v: int):
-        self.temp_label.setText(f"Temperature: {v / 10:.1f}")
+        self.temp_label.setText(f"Temperature  ·  {v / 10:.1f}")
 
     def _on_ctx(self, v: int):
-        self.ctx_label.setText(f"Context length: {v * 1024:,} tokens")
+        self.ctx_label.setText(f"Context length  ·  {v * 1024:,} tokens")
 
     def _on_preset(self, idx: int):
         if idx <= 0:
@@ -464,18 +558,48 @@ class MainWindow(QMainWindow):
         self.settings_panel.setVisible(bool(show))
         self.settings_btn.setChecked(bool(show))
 
+    def _composer_focus(self, focused: bool):
+        self.composer.setProperty("focused", focused)
+        self.composer.style().unpolish(self.composer)
+        self.composer.style().polish(self.composer)
+
     def _zoom(self, delta: int):
-        f = self.view.font()
-        f.setPointSize(max(8, min(24, f.pointSize() + delta)))
-        self.view.setFont(f)
-        self._render()
+        self.chat.set_base_px(max(11, min(22, self.chat.base_px + delta)))
+
+    def _escape(self):
+        if self._busy():
+            self.send_or_stop()
+
+    def _use_prompt(self, text: str):
+        self.input.setPlainText(text)
+        self.input.setFocus()
+        cur = self.input.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        self.input.setTextCursor(cur)
 
     def _about(self):
         QMessageBox.about(
             self, f"About {APP_NAME}",
-            f"<b>{APP_NAME} {__version__}</b><br>A local chat app for your Ollama models, "
+            f"<b>{APP_NAME} {__version__}</b><br>A private chat app for your local Ollama models, "
             f"built for coding help.<br>Everything stays on this computer.",
         )
+
+    def open_testdrive(self):
+        from .testdrive import TestDriveDialog
+        if self.testdrive is None:
+            self.testdrive = TestDriveDialog(self)
+        self.testdrive.show()
+        self.testdrive.raise_()
+        self.testdrive.activateWindow()
+
+    def run_prompt(self, text: str) -> bool:
+        """Start a fresh chat with `text` (used by the test drive). False if busy."""
+        if self._busy():
+            return False
+        self.new_chat()
+        self.input.setPlainText(text)
+        self.send()
+        return True
 
     # ------------------------------------------------------------- models
     def refresh_models(self):
@@ -507,7 +631,7 @@ class MainWindow(QMainWindow):
     def _on_models_failed(self, err: str):
         self.ollama_error = (
             f"Can't reach Ollama at {self.host}.\n"
-            "Start it with:  sudo systemctl start ollama   (then click Refresh)\n\n"
+            "Start it with:  sudo systemctl start ollama   (then click ⟳ to refresh)\n\n"
             f"Details: {err}"
         )
         self.status_label.setText("Ollama not reachable")
@@ -518,14 +642,49 @@ class MainWindow(QMainWindow):
             self.db.update_chat(self.chat_id, model=name)
 
     # -------------------------------------------------------------- chats
+    def chat_rows(self) -> int:
+        """Number of real chats in the list (section headers not counted)."""
+        return sum(1 for i in range(self.chat_list.count())
+                   if self.chat_list.item(i).data(Qt.UserRole) is not None)
+
+    @staticmethod
+    def _group_name(ts: float) -> str:
+        d = datetime.fromtimestamp(ts).date()
+        today = date.today()
+        if d >= today:
+            return "TODAY"
+        if d == today - timedelta(days=1):
+            return "YESTERDAY"
+        if d > today - timedelta(days=7):
+            return "PREVIOUS 7 DAYS"
+        return "OLDER"
+
     def reload_chat_list(self):
         self.chat_list.clear()
+        searching = bool(self.search_box.text().strip())
+        group = None
         for row in self.db.list_chats(self.search_box.text()):
+            if not searching:
+                g = self._group_name(row["updated"])
+                if g != group:
+                    group = g
+                    header = QListWidgetItem(g)
+                    header.setFlags(Qt.NoItemFlags)
+                    self.chat_list.addItem(header)
             item = QListWidgetItem(row["title"])
             item.setData(Qt.UserRole, row["id"])
+            item.setToolTip(row["title"])
             self.chat_list.addItem(item)
             if row["id"] == self.chat_id:
                 self.chat_list.setCurrentItem(item)
+
+    def _update_title(self):
+        title = "New chat"
+        if self.chat_id is not None:
+            chat = self.db.get_chat(self.chat_id)
+            if chat:
+                title = chat["title"]
+        self.title_label.setText(title)
 
     def new_chat(self):
         if self._busy():
@@ -540,13 +699,15 @@ class MainWindow(QMainWindow):
         self.system_edit.blockSignals(True)
         self.system_edit.setPlainText(self.default_system)
         self.system_edit.blockSignals(False)
+        self._update_title()
         self._render()
         self.input.setFocus()
 
     def _on_chat_clicked(self, item: QListWidgetItem):
-        if self._busy():
+        cid = item.data(Qt.UserRole)
+        if cid is None or self._busy():
             return
-        self.open_chat(item.data(Qt.UserRole))
+        self.open_chat(cid)
 
     def open_chat(self, chat_id: int):
         chat = self.db.get_chat(chat_id)
@@ -569,11 +730,12 @@ class MainWindow(QMainWindow):
         elif self.project:
             self._drop_project()
         self._update_context_label()
+        self._update_title()
         self._render(scroll_bottom=True)
 
     def _chat_context_menu(self, pos):
         item = self.chat_list.itemAt(pos)
-        if not item:
+        if not item or item.data(Qt.UserRole) is None:
             return
         menu = QMenu(self)
         rename = menu.addAction("Rename")
@@ -585,6 +747,7 @@ class MainWindow(QMainWindow):
             if ok and text.strip():
                 self.db.update_chat(cid, title=text.strip()[:80])
                 self.reload_chat_list()
+                self._update_title()
         elif chosen == delete:
             if QMessageBox.question(self, "Delete chat", f"Delete “{item.text()}”?") == QMessageBox.Yes:
                 if self._busy() and cid == self.chat_id:
@@ -647,7 +810,7 @@ class MainWindow(QMainWindow):
     def _busy(self) -> bool:
         if (self.worker and self.worker.isRunning()) or \
                 (self.prepare_worker and self.prepare_worker.isRunning()):
-            self.status_label.setText("Wait for the reply to finish, or press Stop.")
+            self.status_label.setText("Wait for the reply to finish, or press Stop (Esc).")
             return True
         return False
 
@@ -681,6 +844,7 @@ class MainWindow(QMainWindow):
                 model=model, system_prompt=self.system_edit.toPlainText(), title=title,
                 project=str(self.project.root) if self.project else "")
             self.reload_chat_list()
+            self._update_title()
         self.db.add_message(self.chat_id, "user", content)
         self.messages.append(("user", content))
         self.input.clear()
@@ -706,7 +870,7 @@ class MainWindow(QMainWindow):
         self._cancel_prepare = False
         self.pending_model = model
         self._set_generating(True)
-        self.status_label.setText("Reading project…" if self.project else "Generating…")
+        self.status_label.setText("Reading project…" if self.project else "Thinking…")
         self.prepare_worker = PrepareWorker(
             self.project, self.system_edit.toPlainText(), list(self.messages), self.num_ctx())
         self.prepare_worker.ready.connect(self._on_prepared)
@@ -729,7 +893,7 @@ class MainWindow(QMainWindow):
         self.worker.finished_ok.connect(self._on_finished)
         self.worker.failed.connect(self._on_failed)
         self.worker.start()
-        self.status_label.setText("Generating…")
+        self.status_label.setText("Thinking…")
 
     def _on_prepare_failed(self, err: str):
         self.streaming_text = None
@@ -739,14 +903,14 @@ class MainWindow(QMainWindow):
         self._render()
 
     def _set_generating(self, on: bool):
-        self.send_btn.setText("Stop" if on else "Send")
-        self.send_btn.setObjectName("danger" if on else "primary")
+        self.send_btn.setText("■" if on else "↑")
+        self.send_btn.setToolTip("Stop (Esc)" if on else "Send (Enter)")
+        self.send_btn.setProperty("busy", on)
         self.send_btn.setEnabled(True)
         self.send_btn.style().unpolish(self.send_btn)
         self.send_btn.style().polish(self.send_btn)
         self.regen_btn.setEnabled(not on)
         self.model_combo.setEnabled(not on)
-        self.status_label.setText("Generating…" if on else self.status_label.text())
 
     def _on_token(self, piece: str):
         self.streaming_text = (self.streaming_text or "") + piece
@@ -756,6 +920,7 @@ class MainWindow(QMainWindow):
 
     def _on_finished(self, full: str):
         elapsed = max(time.time() - self.t_start, 0.001)
+        tps = self.token_count / elapsed
         self.streaming_text = None
         if full.strip():
             self.messages.append(("assistant", full))
@@ -763,10 +928,10 @@ class MainWindow(QMainWindow):
                 self.db.add_message(self.chat_id, "assistant", full)
         self._set_generating(False)
         self.status_label.setText(
-            f"Done  ·  {self.token_count} tokens in {elapsed:.1f}s  "
-            f"({self.token_count / elapsed:.1f} tok/s)")
+            f"{self.token_count} tokens in {elapsed:.1f}s  ·  {tps:.1f} tokens/second")
         self._render()
         self.reload_chat_list()
+        self.reply_done.emit(full, tps, self.pending_model)
         if (self.auto_title_action.isChecked() and len(self.messages) == 2
                 and self.chat_id is not None):
             self.title_worker = TitleWorker(self.model_combo.currentText(), self.messages[0][1], self.host)
@@ -777,6 +942,8 @@ class MainWindow(QMainWindow):
     def _set_title(self, chat_id: int, title: str):
         self.db.update_chat(chat_id, title=title)
         self.reload_chat_list()
+        if chat_id == self.chat_id:
+            self._update_title()
 
     def _on_failed(self, err: str):
         # If some text arrived, finished_ok follows and finishes the UI reset.
@@ -898,16 +1065,17 @@ class MainWindow(QMainWindow):
         bar.setValue(int(max(0, min(100, pct))))
         if self._bar_colors.get(key) != color:
             self._bar_colors[key] = color
-            bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; border-radius: 4px; }}")
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {color}; border-radius: 2px; }}")
 
     @staticmethod
     def _temp_html(t: float | None, warn: float, hot: float) -> str:
         if t is None:
-            return '<span style="color:#8b93a1;">temp n/a</span>'
+            return f'<span style="color:{theme.SUBTLE};">temp n/a</span>'
         return f'<span style="color:{level_color(t, warn, hot)};">{t:.0f}°C</span>'
 
     def _on_stats(self, st: dict):
-        self._set_bar("ram", f"RAM  {st['ram_used']:.1f} / {st['ram_total']:.1f} GB  ({st['ram_pct']:.0f}%)",
+        self.last_stats = st
+        self._set_bar("ram", f"RAM  {st['ram_used']:.1f} / {st['ram_total']:.1f} GB  ·  {st['ram_pct']:.0f}%",
                       st["ram_pct"], level_color(st["ram_pct"], 80, 92))
         cpu_t = st["cpu_temp"]
         self._set_bar("cpu", f"CPU  {st['cpu_pct']:.0f}%  ·  {self._temp_html(cpu_t, 85, 95)}",
@@ -945,59 +1113,12 @@ class MainWindow(QMainWindow):
                 lines.append(f"Loaded: <b>{m['name']}</b>, {where}")
             self.sys_model_label.setText("<br>".join(lines))
         else:
-            self.sys_model_label.setText("No model loaded in Ollama yet (it loads on your first message).")
+            self.sys_model_label.setText("No model loaded yet. It loads on your first message.")
 
     # ----------------------------------------------------------- rendering
     def _render(self, scroll_bottom: bool = False):
-        sb = self.view.verticalScrollBar()
-        near_bottom = sb.value() >= sb.maximum() - 40
-        prev = sb.value()
-
-        if not self.messages and self.streaming_text is None:
-            self.view.setHtml(self._welcome_html())
-            self.codes = []
-            return
-        html_doc, self.codes = render_conversation(
-            self.messages, self.streaming_text, self.model_combo.currentText() or "assistant")
-        if self.ollama_error and self.streaming_text is None:
-            html_doc = html_doc.replace(
-                "</body>",
-                f'<p style="color:#ef6b6b;white-space:pre-wrap;">{_esc(self.ollama_error)}</p></body>')
-        self.view.setHtml(html_doc)
-        if scroll_bottom or near_bottom:
-            sb.setValue(sb.maximum())
-        else:
-            sb.setValue(prev)
-
-    def _welcome_html(self) -> str:
-        msg = ""
-        if self.ollama_error:
-            msg = f'<p style="color:#ef6b6b;white-space:pre-wrap;">{_esc(self.ollama_error)}</p>'
-        return (
-            '<html><body style="color:#8b93a1;">'
-            '<h2 style="color:#e6e6e6;">What are you building today?</h2>'
-            "<p>Ask a coding question, paste an error, or use <b>Attach file</b> to share a source file.</p>"
-            "<ul><li>Pick a model above (1.5b is fast, 7b is smarter)</li>"
-            "<li>Use <b>Settings</b> for the system prompt, temperature and context length</li>"
-            "<li>Click <b>Project</b> to point at a code folder; relevant files are added to each question</li>"
-            "<li>Click <b>Copy</b> on any code block to copy it</li></ul>"
-            f"{msg}</body></html>"
-        )
-
-    def _on_anchor(self, url: QUrl):
-        s = url.toString()
-        if s.startswith("copy:"):
-            try:
-                code = self.codes[int(s.split(":", 1)[1])]
-            except (ValueError, IndexError):
-                return
-            QApplication.clipboard().setText(code)
-            self.status_label.setText("Code copied to clipboard")
-        elif s.startswith(("http://", "https://")):
-            from PySide6.QtGui import QDesktopServices
-            QDesktopServices.openUrl(url)
-
-
-def _esc(s: str) -> str:
-    import html
-    return html.escape(s)
+        err = self.ollama_error if self.streaming_text is None else None
+        self.chat.sync(self.messages, self.streaming_text,
+                       self.model_combo.currentText() or "assistant", error=err)
+        if scroll_bottom:
+            self.chat.scroll_to_bottom()

@@ -24,7 +24,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from plevel.db import Database  # noqa: E402
 from plevel.main_window import MainWindow  # noqa: E402
-from plevel.theme import STYLESHEET  # noqa: E402
+from plevel import theme  # noqa: E402
 
 
 def wait(app, cond, timeout=10.0):
@@ -39,7 +39,8 @@ def wait(app, cond, timeout=10.0):
 
 def main():
     app = QApplication([])
-    app.setStyleSheet(STYLESHEET)
+    theme.load_fonts()
+    app.setStyleSheet(theme.stylesheet())
     tmp = tempfile.mkdtemp()
     win = MainWindow(Database(Path(tmp) / "t.db"))
     win.qs.clear()
@@ -53,8 +54,8 @@ def main():
     win.send()
     assert wait(app, lambda: len(win.messages) == 2 and win.worker and not win.worker.isRunning()), "reply"
     assert win.messages[1][0] == "assistant" and "def add" in win.messages[1][1]
-    assert win.codes and "return a + b" in win.codes[0], "code block should be copyable"
-    assert win.chat_list.count() == 1
+    assert win.chat.code_blocks() and "return a + b" in win.chat.code_blocks()[0], "code block should be copyable"
+    assert win.chat_rows() == 1
     assert len(win.db.get_messages(win.chat_id)) == 2
 
     # attachments
@@ -86,7 +87,7 @@ def main():
     win.new_chat()
     assert win.messages == [] and win.chat_id is None
     win.search_box.setText("add")
-    assert win.chat_list.count() == 1
+    assert win.chat_rows() == 1
     win.search_box.setText("zzzz-no-match")
     assert win.chat_list.count() == 0
     win.search_box.setText("")
